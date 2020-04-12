@@ -70,6 +70,11 @@ Tensor Jacobian(const Tensor& output, const Tensor& input);
  */
 Tensor VectorJacobianProduct(const Tensor &output, const Tensor &input, const Tensor &head);
 
+
+Tensor VectorJacobianProductOptimized(const Tensor &output,
+                                      const Tensor &input,
+                                      const Tensor &head);
+
 /*!
  * \brief Perform reverse mode automatic differentiation.
  *

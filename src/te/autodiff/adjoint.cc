@@ -60,9 +60,13 @@ Tensor Identity(const Tensor& output) {
 }
 
 Tensor VectorJacobianProduct(const Tensor &output, const Tensor &input, const Tensor &head) {
+  Tensor result = VectorJacobianProductOptimized(output, input, head);
+  if (result.get())
+    return result;
+
   Tensor jac = Jacobian(output, input);
-  Tensor result = topi::tensordot(head, jac, /*axes=*/output->shape.size(),
-                                  output->op->name + "." + input->op->name + ".grad");
+  result = topi::tensordot(head, jac, /*axes=*/output->shape.size(),
+                           output->op->name + "." + input->op->name + ".grad");
   return result;
 }
 
