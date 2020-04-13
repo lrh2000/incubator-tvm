@@ -51,37 +51,63 @@ class TensorArgsCollector : public ExprFunctor<void(const PrimExpr&)> {
   }
 
   void VisitExpr_(const CallNode *op) override {
-    if (op->call_type == CallNode::Halide) {
+    switch(op->call_type)
+    {
+    case CallNode::Halide:
       if (op->func.same_as(input_->op))
         args_.push_back(op->args);
-      return;
+      break;
+
+    case CallNode::PureIntrinsic:
+      for (const PrimExpr& arg : op->args)
+        VisitExpr(arg);
+      break;
+
+    default:
+      throw NotImplementedError(FILE_POSITION);
     }
-    NOT_IMPLEMENTED;
   }
 
-  void VisitExpr_(const AddNode* op) override
-  {
+  void VisitExpr_(const AddNode* op) override {
     VisitExpr(op->a);
     VisitExpr(op->b);
   }
 
-  void VisitExpr_(const SubNode* op) override
-  {
+  void VisitExpr_(const SubNode* op) override {
     VisitExpr(op->a);
     VisitExpr(op->b);
   }
 
-  void VisitExpr_(const MulNode* op) override
-  {
+  void VisitExpr_(const MulNode* op) override {
     VisitExpr(op->a);
     VisitExpr(op->b);
   }
 
-  void VisitExpr_(const DivNode* op) override
-  {
+  void VisitExpr_(const DivNode* op) override {
     VisitExpr(op->a);
     VisitExpr(op->b);
   }
+
+  void VisitExpr_(const MinNode* op) override {
+    VisitExpr(op->a);
+    VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const MaxNode* op) override {
+    VisitExpr(op->a);
+    VisitExpr(op->b);
+  }
+
+  void VisitExpr_(const CastNode* op) override {
+    VisitExpr(op->value);
+  }
+
+  void VisitExpr_(const SelectNode* op) override {
+    VisitExpr(op->true_value);
+    VisitExpr(op->false_value);
+  }
+
+  void VisitExpr_(const IntImmNode* op) override {}
 
   void VisitExpr_(const FloatImmNode* op) override {}
 
@@ -93,8 +119,6 @@ class TensorArgsCollector : public ExprFunctor<void(const PrimExpr&)> {
   void VisitExpr_(const ModNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const FloorDivNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const FloorModNode* op) override NOT_IMPLEMENTED;
-  void VisitExpr_(const MinNode* op) override NOT_IMPLEMENTED;
-  void VisitExpr_(const MaxNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const EQNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const NENode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const LTNode* op) override NOT_IMPLEMENTED;
@@ -104,13 +128,10 @@ class TensorArgsCollector : public ExprFunctor<void(const PrimExpr&)> {
   void VisitExpr_(const AndNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const OrNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const ReduceNode* op) override NOT_IMPLEMENTED;
-  void VisitExpr_(const CastNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const NotNode* op) override NOT_IMPLEMENTED;
-  void VisitExpr_(const SelectNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const RampNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const BroadcastNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const ShuffleNode* op) override NOT_IMPLEMENTED;
-  void VisitExpr_(const IntImmNode* op) override NOT_IMPLEMENTED;
   void VisitExpr_(const StringImmNode* op) override NOT_IMPLEMENTED;
 
  private:
@@ -130,41 +151,100 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
     return Substitute(new_expr, vmap_);
   }
 
+  PrimExpr VisitExpr(const PrimExpr& expr) {
+    if (expr.dtype().is_int() || expr.dtype().is_uint())
+      throw NotImplementedError(FILE_POSITION);
+    return ExprFunctor::VisitExpr(expr);
+  }
+
   PrimExpr VisitExpr_(const CallNode *op) override {
     if (op->call_type == CallNode::Halide) {
       if (op->func.same_as(input_->op) && op->args.same_as(args_))
         return FloatImm(op->dtype, 1.0);
       else
         return FloatImm(op->dtype, 0.0);
+    } else if (op->call_type == CallNode::PureIntrinsic) {
+      PrimExpr expr = GetRef<PrimExpr>(op);
+      if (op->name == "log") {
+        return DivNode::make(VisitExpr(op->args[0]), op->args[0]);
+      } else if (op->name == "pow") {
+        PrimExpr x = op->args[0], y = op->args[1];
+        PrimExpr mid = AddNode::make(
+            MulNode::make(VisitExpr(y),
+              CallNode::make(x.dtype(), "log", {x}, CallNode::PureIntrinsic)),
+            MulNode::make(VisitExpr(x), DivNode::make(y, x)));
+        return MulNode::make(expr, mid);
+      } else if (op->name == intrinsic::tvm_if_then_else) {
+        Array<PrimExpr> args = {op->args[0], VisitExpr(op->args[1]), VisitExpr(op->args[2])};
+        return CallNode::make(op->dtype, intrinsic::tvm_if_then_else, args,
+                              CallNode::PureIntrinsic, op->func, op->value_index);
+      }
+
+      PrimExpr result;
+      if (op->name == "exp")
+        result = expr;
+      else if (op->name == "sigmoid")
+        result = MulNode::make(expr, SubNode::make(FloatImm(op->dtype, 1.0), expr));
+      else if (op->name == "sqrt")
+        result = DivNode::make(FloatImm(op->dtype, 0.5), expr);
+      else if (op->name == "tanh")
+        result = SubNode::make(FloatImm(op->dtype, 1.0), MulNode::make(expr, expr));
+      else if (op->name == "fabs")
+        result = SelectNode::make(GENode::make(op->args[0], FloatImm(op->dtype, 0.0)),
+                                  FloatImm(op->dtype, 1.0), FloatImm(op->dtype, -1.0));
+      else
+        throw NotImplementedError(FILE_POSITION);
+
+      return MulNode::make(VisitExpr(op->args[0]), result);
     }
-    NOT_IMPLEMENTED;
+
+    throw NotImplementedError(FILE_POSITION);
   }
 
-  PrimExpr VisitExpr_(const FloatImmNode* op) override
-  {
-    return FloatImm(op->dtype, 0.0);
-  }
-
-  PrimExpr VisitExpr_(const AddNode* op) override
-  {
+  PrimExpr VisitExpr_(const AddNode* op) override {
     return AddNode::make(VisitExpr(op->a), VisitExpr(op->b));
   }
 
-  PrimExpr VisitExpr_(const SubNode* op) override
-  {
+  PrimExpr VisitExpr_(const SubNode* op) override {
     return SubNode::make(VisitExpr(op->a), VisitExpr(op->b));
   }
 
-  PrimExpr VisitExpr_(const MulNode* op) override
-  {
+  PrimExpr VisitExpr_(const MulNode* op) override {
     return AddNode::make(MulNode::make(VisitExpr(op->a), op->b),
                          MulNode::make(op->a, VisitExpr(op->b)));
   }
 
-  PrimExpr VisitExpr_(const DivNode* op) override
-  {
+  PrimExpr VisitExpr_(const DivNode* op) override {
     return DivNode::make(SubNode::make(MulNode::make(VisitExpr(op->a), op->b),
           MulNode::make(op->a, VisitExpr(op->b))), MulNode::make(op->b, op->b));
+  }
+
+  PrimExpr VisitExpr_(const MinNode* op) override {
+    return SelectNode::make(LENode::make(op->a, op->b),
+                            VisitExpr(op->a), VisitExpr(op->b));
+  }
+
+  PrimExpr VisitExpr_(const MaxNode* op) override {
+    return SelectNode::make(GENode::make(op->a, op->b),
+                            VisitExpr(op->a), VisitExpr(op->b));
+  }
+
+  PrimExpr VisitExpr_(const CastNode* op) override {
+    CHECK(op->dtype.is_float());
+    return CastNode::make(op->dtype, VisitExpr(op->value));
+  }
+
+  PrimExpr VisitExpr_(const SelectNode* op) override {
+    return SelectNode::make(op->condition,
+                            VisitExpr(op->true_value), VisitExpr(op->false_value));
+  }
+
+  PrimExpr VisitExpr_(const IntImmNode* op) override {
+    return FloatImm(op->dtype, 0.0);
+  }
+
+  PrimExpr VisitExpr_(const FloatImmNode* op) override {
+    return FloatImm(op->dtype, 0.0);
   }
 
   PrimExpr VisitExpr_(const VarNode* op) override NOT_IMPLEMENTED;
@@ -175,8 +255,6 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
   PrimExpr VisitExpr_(const ModNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const FloorDivNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const FloorModNode* op) override NOT_IMPLEMENTED;
-  PrimExpr VisitExpr_(const MinNode* op) override NOT_IMPLEMENTED;
-  PrimExpr VisitExpr_(const MaxNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const EQNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const NENode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const LTNode* op) override NOT_IMPLEMENTED;
@@ -186,13 +264,10 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
   PrimExpr VisitExpr_(const AndNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const OrNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const ReduceNode* op) override NOT_IMPLEMENTED;
-  PrimExpr VisitExpr_(const CastNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const NotNode* op) override NOT_IMPLEMENTED;
-  PrimExpr VisitExpr_(const SelectNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const RampNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const BroadcastNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const ShuffleNode* op) override NOT_IMPLEMENTED;
-  PrimExpr VisitExpr_(const IntImmNode* op) override NOT_IMPLEMENTED;
   PrimExpr VisitExpr_(const StringImmNode* op) override NOT_IMPLEMENTED;
 
  private:
@@ -279,6 +354,7 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
 
       result = result.get() ? AddNode::make(result, e) : e;
     }
+    result = Simplify(result);
   } catch (vjp::NotImplementedError &err) {
     LOG(INFO) << err.what();
     return Tensor();
