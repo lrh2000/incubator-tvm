@@ -85,6 +85,12 @@ def test_basic_operation():
     B = te.compute(shape, lambda i, j: A0[i, j], name='B')
     check_grad(B, [A0])
 
+    B = te.compute(shape, lambda i, j: A0[i, i], name='B')
+    check_grad(B, [A0])
+
+    B = te.compute(tuple(k - 2 for k in shape), lambda i, j: A0[i + 2, j + 2], name='B')
+    check_grad(B, [A0])
+
     B = te.compute(shape, lambda i, j: A0[i, j] + A1[i, j], name='B')
     check_grad(B, [A0, A1])
 

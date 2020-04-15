@@ -341,8 +341,6 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
 
       arith::IntConstraints constraints(vars, ranges, eqs);
       arith::IntConstraintsTransform tf = arith::SolveLinearEquations(constraints);
-      if (tf->dst->variables.size() != 0)
-        throw vjp::NotImplementedError(FILE_POSITION);
 
       vjp::TensorArgsReplacer replacer(input, arg, tf->src_to_dst);
       PrimExpr e = replacer.Replace(expr);
@@ -351,6 +349,23 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
         head_indices.Set(output_offset + i, tf->src_to_dst[vars[i]]);
       e = MulNode::make(e, CallNode::make(head->dtype,
             head->op->name, head_indices, CallNode::Halide, head->op, head->value_index));
+
+      if (tf->dst->relations.size() != 0) {
+        PrimExpr cond;
+        for (const auto& rel : tf->dst->relations)
+          cond = cond.get() ? AndNode::make(cond, rel) : rel;
+        e = if_then_else(cond, e, make_zero(e.dtype()));
+      }
+      if (tf->dst->variables.size() != 0) {
+        Array<IterVar> sum_axis;
+        Map<Var, PrimExpr> vmap;
+        for (const auto& it : tf->dst->ranges) {
+          IterVar var = reduce_axis(it.second, it.first->name_hint);
+          sum_axis.push_back(var);
+          vmap.Set(it.first, var->var);
+        }
+        e = sum(Substitute(e, vmap), sum_axis);
+      }
 
       result = result.get() ? AddNode::make(result, e) : e;
     }
