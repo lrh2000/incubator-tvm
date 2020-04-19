@@ -51,7 +51,7 @@ class TensorArgsCollector : public ExprFunctor<void(const PrimExpr&)> {
     return std::move(args_);
   }
 
-  void VisitExpr_(const CallNode *op) override {
+  void VisitExpr_(const CallNode* op) override {
     switch(op->call_type)
     {
     case CallNode::Halide:
@@ -174,7 +174,7 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
     return ExprFunctor::VisitExpr(expr);
   }
 
-  PrimExpr VisitExpr_(const CallNode *op) override {
+  PrimExpr VisitExpr_(const CallNode* op) override {
     if (op->call_type == CallNode::Halide) {
       if (op->func.same_as(input_->op) && op->args.same_as(args_))
         return FloatImm(op->dtype, 1.0);
@@ -403,15 +403,209 @@ PrimExpr TensorizeExpr(const PrimExpr& expr,
   return CallNode::make(new_expr.dtype(), name, values, CallNode::Halide, op, value_index);
 }
 
+std::pair<PrimExpr, Array<PrimExpr>> CalcOneByOneDerivative(
+                                        int idx,
+                                        const Tensor& input,
+                                        const Array<IterVar>& input_iv,
+                                        const Array<PrimExpr>& args,
+                                        const arith::IntConstraintsTransform& tf,
+                                        const Tensor& output,
+                                        const PrimExpr& head_val) {
+  PrimExpr sub_result;
+  Array<PrimExpr> cond;
+
+  const ComputeOpNode* op = output->op.as<ComputeOpNode>();
+  CHECK(op);
+  CHECK_EQ(args.size(), tf->src->relations.size());
+  CHECK_EQ(input_iv.size(), tf->src->relations.size());
+  CHECK_EQ(op->axis.size() + op->reduce_axis.size(), tf->src->variables.size());
+
+  PrimExpr expr = op->body[output->value_index];
+  const ReduceNode* reduce = expr.as<ReduceNode>();
+  CHECK(reduce);
+
+  PrimExpr sub_cond;
+  for (const auto& iv : reduce->axis) {
+    PrimExpr e = NENode::make(tf->src_to_dst[iv->var], iv->var);
+    sub_cond = sub_cond.get() ? AndNode::make(sub_cond, e) : e;
+  }
+  for (const auto& rel : tf->dst->relations)
+    cond.push_back(rel);
+
+  TensorArgsReplacer replacer(input, args, tf->src_to_dst,
+                              TensorArgsReplacer::kReducePartially, sub_cond);
+  PrimExpr e = replacer.Replace(expr);
+
+  Array<IterVar> new_axis = input_iv;
+  for (const auto& it : tf->dst->ranges)
+    new_axis.push_back(IterVarNode::make(it.second, it.first, IterVarType::kDataPar));
+  PrimExpr part_expr = TensorizeExpr(e, new_axis,
+          output->op->name + ".part" + std::to_string(idx), output->op);
+
+  CommReducer combiner = reduce->combiner;
+  Map<Var, PrimExpr> vmap;
+  replacer = TensorArgsReplacer(input, args, tf->src_to_dst,
+                                TensorArgsReplacer::kReduceSkip);
+  e = Derivative(combiner->result[0], combiner->rhs[0]);
+  vmap.Set(combiner->lhs[0], part_expr);
+  vmap.Set(combiner->rhs[0], Substitute(reduce->source[0], tf->src_to_dst));
+  sub_result = MulNode::make(Substitute(e, vmap), replacer.Replace(expr));
+
+  sub_result = MulNode::make(sub_result, Substitute(head_val, tf->src_to_dst));
+  sub_result = Simplify(sub_result);
+
+  return std::make_pair(sub_result, cond);
+}
+
+std::pair<PrimExpr, Array<PrimExpr>> CalcConditionalDerivative(
+                                        int idx,
+                                        const Tensor& input,
+                                        const Array<IterVar>& axis,
+                                        const Array<PrimExpr>& args,
+                                        const arith::IntConstraintsTransform& tf,
+                                        const Tensor& output,
+                                        const PrimExpr& head_val) {
+  PrimExpr sub_result;
+  Array<PrimExpr> cond;
+
+  const ComputeOpNode* op = output->op.as<ComputeOpNode>();
+  CHECK(op);
+  CHECK_EQ(args.size(), tf->src->relations.size());
+  CHECK_EQ(op->axis.size(), tf->src->variables.size());
+
+  PrimExpr expr = op->body[output->value_index];
+  const ReduceNode* reduce = expr.as<ReduceNode>();
+  CHECK(reduce);
+
+  std::unordered_set<const VarNode*> vset;
+  for (const auto& iv : reduce->axis)
+    vset.insert(iv->var.get());
+
+  PrimExpr sub_cond;
+  for (const auto& rel : tf->dst->relations) {
+    if (ExprUseVar(rel, vset))
+      sub_cond = sub_cond.get() ? AndNode::make(sub_cond, rel) : rel;
+    else
+      cond.push_back(rel);
+  }
+
+  TensorArgsReplacer replacer(input, args, tf->src_to_dst,
+                              TensorArgsReplacer::kReduceDerivative, sub_cond,
+                              Substitute(head_val, tf->src_to_dst));
+  sub_result = replacer.Replace(expr);
+
+  Array<IterVar> new_axis = axis;
+  for (const auto& it : tf->dst->ranges)
+    new_axis.push_back(IterVarNode::make(it.second, it.first, IterVarType::kDataPar));
+  sub_result = TensorizeExpr(sub_result, new_axis,
+                             input->op->name + ".deri" + std::to_string(idx), input->op);
+
+  return std::make_pair(sub_result, cond);
+}
+
+std::pair<PrimExpr, Array<PrimExpr>> CalcNormalDerivative(
+                                        const Tensor& input,
+                                        const Array<IterVar>& input_iv,
+                                        const Array<PrimExpr>& args,
+                                        const arith::IntConstraintsTransform& tf,
+                                        const Tensor& output,
+                                        const PrimExpr& head_val) {
+  PrimExpr sub_result;
+  Array<PrimExpr> cond;
+
+  const ComputeOpNode* op = output->op.as<ComputeOpNode>();
+  CHECK(op);
+  CHECK_EQ(args.size(), tf->src->relations.size());
+  CHECK_EQ(input_iv.size(), tf->src->relations.size());
+  CHECK_EQ(op->axis.size(), tf->src->variables.size());
+  CHECK_EQ(op->reduce_axis.size(), (size_t)0);
+
+  PrimExpr expr = op->body[output->value_index];
+
+  for (const auto& rel : tf->dst->relations)
+    cond.push_back(rel);
+
+  TensorArgsReplacer replacer(input, args, tf->src_to_dst);
+  sub_result = replacer.Replace(expr);
+  sub_result = MulNode::make(sub_result, Substitute(head_val, tf->src_to_dst));
+
+  return std::make_pair(sub_result, cond);
+}
+
+bool ChooseDerivativeMethod(const arith::IntConstraintsTransform& tf,
+                            const Tensor& output) {
+  bool result = true;
+
+  const ComputeOpNode* op = output->op.as<ComputeOpNode>();
+  CHECK(op);
+  CHECK_EQ(op->reduce_axis.size(), tf->src->variables.size());
+
+  PrimExpr expr = op->body[output->value_index];
+  const ReduceNode* reduce = expr.as<ReduceNode>();
+  CHECK(reduce);
+  if (reduce->source.size() > 1) // TODO: Remove this demand.
+    return false;
+
+  std::unordered_set<const VarNode*> vset;
+  for (const auto& v : tf->dst->variables)
+    vset.insert(v.get());
+  for (const auto& iv : op->reduce_axis)
+    result = result && !ExprUseVar(tf->src_to_dst[iv->var], vset);
+  // TODO: Choose different methods for different axes,
+  //       according to their respective flags.
+
+  return result;
+}
+
+PrimExpr SumUpDerivatives(const PrimExpr& expr,
+                          const Array<PrimExpr>& cond,
+                          const arith::IntConstraints& dst,
+                          int idx,
+                          const Array<IterVar>& axis,
+                          const Tensor& input) {
+  PrimExpr outer_cond, inner_cond;
+  std::unordered_set<const VarNode*> vset;
+  for (const Var& var : dst->variables)
+    vset.insert(var.get());
+  for (const auto& rel : cond) {
+    if (ExprUseVar(rel, vset))
+      inner_cond = inner_cond.get() ? AndNode::make(inner_cond, rel) : rel;
+    else
+      outer_cond = outer_cond.get() ? AndNode::make(outer_cond, rel) : rel;
+  }
+
+  // TODO: Remove useless conditions (conditions which are always TRUE).
+  PrimExpr result = expr;
+  if (inner_cond.get())
+    result = if_then_else(inner_cond, result, make_zero(result.dtype()));
+  if (dst->variables.size() != 0) {
+    Array<IterVar> sum_axis;
+    Map<Var, PrimExpr> vmap;
+    for (const auto& it : dst->ranges) {
+      IterVar var = reduce_axis(it.second, it.first->name_hint);
+      sum_axis.push_back(var);
+      vmap.Set(it.first, var->var);
+    }
+    result = sum(Substitute(result, vmap), sum_axis);
+  }
+  if (outer_cond.get()) {
+    if (result.as<ReduceNode>())
+      result = TensorizeExpr(result, axis,
+            input->op->name + ".grad" + std::to_string(idx), input->op);
+    result = if_then_else(outer_cond, result, make_zero(result.dtype()));
+  }
+
+  return result;
+}
+
 } // namespace vjp
 
-// TODO: Split this large function into small ones.
 // TODO: Add comments.
 Tensor VectorJacobianProductOptimized(const Tensor& output,
                                       const Tensor& input,
                                       const Tensor& head)
 {
-  const ComputeOpNode *op = output->op.as<ComputeOpNode>();
+  const ComputeOpNode* op = output->op.as<ComputeOpNode>();
   if (!op) // not implemented
     return Tensor();
 
@@ -419,8 +613,8 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
       << "head->shape shouldn't have less elements than output->shape";
 
   Array<PrimExpr> shape;
-  Array<IterVar> axis;
-  Array<PrimExpr> input_indices, head_indices;
+  Array<IterVar> axis, input_axis;
+  Array<PrimExpr> head_indices;
   size_t output_offset = head->shape.size() - output->shape.size();
 
   for (size_t i = 0; i < output_offset; ++i) {
@@ -432,8 +626,10 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
     axis.push_back(iv);
     head_indices.push_back(iv);
   }
-  for (size_t i = 0; i < output->shape.size(); ++i)
-    head_indices.push_back(PrimExpr());
+  for (const IterVar& it : op->axis)
+    head_indices.push_back(it->var);
+  PrimExpr head_val = CallNode::make(head->dtype, head->op->name,
+          head_indices, CallNode::Halide, head->op, head->value_index);
 
   for (size_t i = 0; i < input->shape.size(); ++i) {
     PrimExpr ext = input->shape[i];
@@ -442,7 +638,23 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
 
     shape.push_back(ext);
     axis.push_back(iv);
-    input_indices.push_back(iv);
+    input_axis.push_back(iv);
+  }
+
+  Array<Var> vars;
+  Map<Var, Range> ranges;
+  for (const IterVar& it : op->axis) {
+    vars.push_back(it->var);
+    ranges.Set(it->var, it->dom);
+  }
+
+  Array<Var> reduce_vars, all_vars = vars;
+  Map<Var, Range> reduce_ranges, all_ranges = ranges;
+  for (const IterVar& it : op->reduce_axis) {
+    reduce_vars.push_back(it->var);
+    all_vars.push_back(it->var);
+    reduce_ranges.Set(it->var, it->dom);
+    all_ranges.Set(it->var, it->dom);
   }
 
   PrimExpr expr = op->body[output->value_index];
@@ -452,170 +664,53 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
     vjp::TensorArgsCollector collector(input);
     Array<Array<PrimExpr>> args = collector.Collect(expr);
 
-    Array<Var> vars;
-    Map<Var, Range> ranges;
-    for (const IterVar& it : op->axis) {
-      vars.push_back(it->var);
-      ranges.Set(it->var, it->dom);
-    }
-
-    Array<Var> reduce_vars, all_vars = vars;
-    Map<Var, Range> reduce_ranges, all_ranges = ranges;
-    for (const IterVar& it : op->reduce_axis) {
-      reduce_vars.push_back(it->var);
-      all_vars.push_back(it->var);
-      reduce_ranges.Set(it->var, it->dom);
-      all_ranges.Set(it->var, it->dom);
-    }
-
-    size_t part_id = 0, deri_id = 0, sub_id = 0;
-    for (const Array<PrimExpr>& arg : args) {
-      CHECK_EQ(arg.size(), input_indices.size());
+    for (size_t idx = 0; idx < args.size(); ++idx) {
+      Array<PrimExpr> arg = args[idx];
+      CHECK_EQ(arg.size(), input_axis.size());
 
       Array<PrimExpr> eqs;
       for (size_t i = 0; i < arg.size(); ++i)
-        eqs.push_back(EQNode::make(arg[i], input_indices[i]));
+        eqs.push_back(EQNode::make(arg[i], input_axis[i]->var));
 
       PrimExpr sub_result;
       Array<PrimExpr> cond;
+      arith::IntConstraints constraints;
+      arith::IntConstraintsTransform tf;
       const ReduceNode* reduce = op->body[output->value_index].as<ReduceNode>();
       CHECK_EQ((bool)reduce, (bool)op->reduce_axis.size());
 
-      bool flag = false;
       if (reduce) {
-        arith::IntConstraints constraints(reduce_vars, reduce_ranges, eqs);
-        arith::IntConstraintsTransform tf = arith::SolveLinearEquations(constraints);
-
-        std::unordered_set<const VarNode*> vset;
-        for (const auto& v : tf->dst->variables)
-          vset.insert(v.get());
-        for (const auto& iv : op->reduce_axis)
-          flag |= ExprUseVar(tf->src_to_dst[iv->var], vset);
-          // TODO: Pick axes with TRUE flags here.
+        constraints = arith::IntConstraints(reduce_vars, reduce_ranges, eqs);
+        tf = arith::SolveLinearEquations(constraints);
       }
 
-      arith::IntConstraints constraints(all_vars, all_ranges, eqs);
-      arith::IntConstraintsTransform tf = arith::SolveLinearEquations(constraints);
-
-      if (reduce && reduce->source.size() == 1 && !flag) {
-        PrimExpr sub_cond;
-        for (const auto& iv : op->reduce_axis) {
-          PrimExpr e = NENode::make(tf->src_to_dst[iv->var], iv->var);
-          sub_cond = sub_cond.get() ? AndNode::make(sub_cond, e) : e;
-        }
-        for (const auto& rel : tf->dst->relations)
-          cond.push_back(rel);
-
-        vjp::TensorArgsReplacer replacer(input, arg, tf->src_to_dst,
-            vjp::TensorArgsReplacer::kReducePartially, sub_cond);
-        PrimExpr e = replacer.Replace(expr);
-
-        Array<IterVar> new_axis;
-        for (size_t i = output_offset; i < axis.size(); ++i)
-          new_axis.push_back(axis[i]);
-        for (const auto& it : tf->dst->ranges)
-          new_axis.push_back(IterVarNode::make(it.second, it.first, IterVarType::kDataPar));
-        PrimExpr part_expr = vjp::TensorizeExpr(e, new_axis,
-            output->op->name + ".part" + std::to_string(part_id++), output->op);
-
-        CommReducer combiner = reduce->combiner;
-        Map<Var, PrimExpr> vmap;
-        replacer = vjp::TensorArgsReplacer(input, arg, tf->src_to_dst,
-            vjp::TensorArgsReplacer::kReduceSkip);
-        e = Derivative(combiner->result[0], combiner->rhs[0]);
-        vmap.Set(combiner->lhs[0], part_expr);
-        vmap.Set(combiner->rhs[0], Substitute(reduce->source[0], tf->src_to_dst));
-        sub_result = MulNode::make(Substitute(e, vmap), replacer.Replace(expr));
-
-        for (size_t i = 0; i < vars.size(); ++i)
-          head_indices.Set(output_offset + i, tf->src_to_dst[vars[i]]);
-        sub_result = MulNode::make(sub_result, CallNode::make(head->dtype,
-              head->op->name, head_indices, CallNode::Halide, head->op, head->value_index));
-        sub_result = Simplify(sub_result);
-      } else if (reduce) {
-        std::unordered_set<const VarNode*> vset;
-        for (const auto& iv : op->reduce_axis)
-          vset.insert(iv->var.get());
-
-        PrimExpr sub_cond;
+      if (reduce && vjp::ChooseDerivativeMethod(tf, output)) {
+        constraints = arith::IntConstraints(all_vars, all_ranges, eqs);
+        tf = arith::SolveLinearEquations(constraints);
+        std::tie(sub_result, cond) = vjp::CalcOneByOneDerivative(
+                idx, input, input_axis, arg, tf, output, head_val);
+      } else {
         constraints = arith::IntConstraints(vars, ranges, eqs);
         tf = arith::SolveLinearEquations(constraints);
-        for (const auto& rel : tf->dst->relations) {
-          if (ExprUseVar(rel, vset))
-            sub_cond = sub_cond.get() ? AndNode::make(sub_cond, rel) : rel;
-          else
-            cond.push_back(rel);
-        }
-
-        for (size_t i = 0; i < vars.size(); ++i)
-          head_indices.Set(output_offset + i, tf->src_to_dst[vars[i]]);
-        PrimExpr head_val = CallNode::make(head->dtype, head->op->name,
-            head_indices, CallNode::Halide, head->op, head->value_index);
-
-        vjp::TensorArgsReplacer replacer(input, arg, tf->src_to_dst,
-            vjp::TensorArgsReplacer::kReduceDerivative, sub_cond, head_val);
-        sub_result = replacer.Replace(expr);
-
-        Array<IterVar> new_axis = axis;
-        for (const auto& it : tf->dst->ranges)
-          new_axis.push_back(IterVarNode::make(it.second, it.first, IterVarType::kDataPar));
-        sub_result = vjp::TensorizeExpr(sub_result, new_axis,
-            input->op->name + ".deri" + std::to_string(deri_id++), input->op);
-      } else {
-        for (const auto& rel : tf->dst->relations)
-          cond.push_back(rel);
-
-        vjp::TensorArgsReplacer replacer(input, arg, tf->src_to_dst);
-        sub_result = replacer.Replace(expr);
-
-        for (size_t i = 0; i < vars.size(); ++i)
-          head_indices.Set(output_offset + i, tf->src_to_dst[vars[i]]);
-        sub_result = MulNode::make(sub_result, CallNode::make(head->dtype,
-              head->op->name, head_indices, CallNode::Halide, head->op, head->value_index));
-      }
-
-      PrimExpr outer_cond, inner_cond;
-      std::unordered_set<const VarNode*> vset;
-      for (const Var& var : tf->dst->variables)
-        vset.insert(var.get());
-      for (const auto& rel : cond) {
-        if (ExprUseVar(rel, vset))
-          inner_cond = inner_cond.get() ? AndNode::make(inner_cond, rel) : rel;
+        if (reduce)
+          std::tie(sub_result, cond) = vjp::CalcConditionalDerivative(
+                  idx, input, axis, arg, tf, output, head_val);
         else
-          outer_cond = outer_cond.get() ? AndNode::make(outer_cond, rel) : rel;
+          std::tie(sub_result, cond) = vjp::CalcNormalDerivative(
+                    input, input_axis, arg, tf, output, head_val);
       }
 
-      // TODO: Remove useless conditions (conditions which are always TRUE).
-      if (inner_cond.get())
-        sub_result = if_then_else(inner_cond, sub_result, make_zero(sub_result.dtype()));
-      if (tf->dst->variables.size() != 0) {
-        Array<IterVar> sum_axis;
-        Map<Var, PrimExpr> vmap;
-        for (const auto& it : tf->dst->ranges) {
-          IterVar var = reduce_axis(it.second, it.first->name_hint);
-          sum_axis.push_back(var);
-          vmap.Set(it.first, var->var);
-        }
-        sub_result = sum(Substitute(sub_result, vmap), sum_axis);
-      }
-      if (outer_cond.get()) {
-        if (sub_result.as<ReduceNode>())
-          sub_result = vjp::TensorizeExpr(sub_result, axis,
-              input->op->name + ".grad" + std::to_string(sub_id++), input->op);
-        sub_result = if_then_else(outer_cond, sub_result, make_zero(sub_result.dtype()));
-      }
+      sub_result = vjp::SumUpDerivatives(sub_result, cond, tf->dst, idx, axis, input);
 
-      if (result.get()) {
-        if (result.as<ReduceNode>())
-          result = vjp::TensorizeExpr(result, axis,
-              input->op->name + ".grad" + std::to_string(sub_id++), input->op);
-        if (sub_result.as<ReduceNode>())
-          sub_result = vjp::TensorizeExpr(sub_result, axis,
-              input->op->name + ".grad" + std::to_string(sub_id++), input->op);
-      }
+      if (result.as<ReduceNode>())
+        result = vjp::TensorizeExpr(result, axis,
+            input->op->name + ".grad" + std::to_string(idx - 1), input->op);
+      if (result.get() && sub_result.as<ReduceNode>())
+        sub_result = vjp::TensorizeExpr(sub_result, axis,
+            input->op->name + ".grad" + std::to_string(idx), input->op);
       result = result.get() ? AddNode::make(result, sub_result) : sub_result;
     }
-  } catch (vjp::NotImplementedError &err) {
+  } catch (vjp::NotImplementedError& err) {
     LOG(INFO) << err.what();
     return Tensor();
   }
