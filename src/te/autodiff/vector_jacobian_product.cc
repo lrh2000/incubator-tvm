@@ -41,6 +41,12 @@ public:
 #define NOT_IMPLEMENTED \
   { throw NotImplementedError(FILE_POSITION); }
 
+/*
+ * Given a tensor and an expression, suppose there are some calls made to
+ * the tensor in the expression. This class will collect all these calls'
+ * argument lists together to form a list. Thus the return value is a list
+ * of lists of arguments (Array<Array<PrimExpr>>).
+ */
 class TensorArgsCollector : public ExprFunctor<void(const PrimExpr&)> {
  public:
   TensorArgsCollector(const Tensor& input)
@@ -60,6 +66,7 @@ class TensorArgsCollector : public ExprFunctor<void(const PrimExpr&)> {
       break;
 
     case CallNode::PureIntrinsic:
+      // Arguments like the first argument in tvm_if_then_else are skipped.
       for (const PrimExpr& arg : op->args)
         if (!arg.dtype().is_bool())
           VisitExpr(arg);
@@ -145,6 +152,23 @@ class TensorArgsCollector : public ExprFunctor<void(const PrimExpr&)> {
   Array<Array<PrimExpr>> args_;
 };
 
+/*
+ * Generally, this class will take the derivative of a given expression,
+ * with respect to a given tensor with a given list of arguments. All
+ * other tensors and the same tensor but with another list of arguments
+ * will be treated as a constant.
+ *
+ * But for ReduceNode, things are different. The behavior depends on the
+ * value reduce_type_, as following:
+ *  kReduceDerivative:
+ *    Keep the ReduceNode. When reduce_cond_ is true, take the derivative
+ *    and multiply it by head_val_.
+ *  kReducePartially:
+ *    Keep the ReduceNode, but only perform reduction when reduce_cond_
+ *    is true, and never take the derivative.
+ *  kReduceSkip:
+ *    Remove the ReduceNode, and take the derivative of its body directly.
+ */
 class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
  public:
   enum ReduceType {
@@ -161,7 +185,7 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
                      const PrimExpr& reduce_cond = PrimExpr(),
                      const PrimExpr& head_val = PrimExpr())
     : input_(input), args_(args), vmap_(vmap), reduce_type_(reduce_type),
-      reduce_cond_(reduce_cond), head_val_(head_val) {}
+      reduce_cond_(reduce_cond), head_val_(head_val), replaced_(false) {}
 
   PrimExpr Replace(const PrimExpr& expr) {
     auto new_expr = VisitExpr(expr);
@@ -176,10 +200,14 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
 
   PrimExpr VisitExpr_(const CallNode* op) override {
     if (op->call_type == CallNode::Halide) {
-      if (op->func.same_as(input_->op) && op->args.same_as(args_))
+      if (op->func.same_as(input_->op) && op->args.same_as(args_)) {
+        if (replaced_) // TODO: Can this happen?
+          throw NotImplementedError(FILE_POSITION);
+        replaced_ = true;
         return FloatImm(op->dtype, 1.0);
-      else
+      } else {
         return FloatImm(op->dtype, 0.0);
+      }
     } else if (op->call_type == CallNode::PureIntrinsic) {
       PrimExpr expr = GetRef<PrimExpr>(op);
       if (op->name == "log") {
@@ -254,6 +282,7 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
 
     CommReducer combiner = op->combiner;
     if (reduce_type_ == kReduceDerivative) {
+      // Build a new combiner for taking the derivative.
       Array<Var> lhs, rhs;
       Array<PrimExpr> result, identity;
 
@@ -291,6 +320,7 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
       combiner = CommReducerNode::make(lhs, rhs, result, identity);
     }
 
+    // Clone original reduction axes.
     Array<IterVar> axis;
     Map<Var, PrimExpr> vmap;
     for (const auto& iv : op->axis) {
@@ -301,6 +331,7 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
 
     Array<PrimExpr> source;
     if (reduce_type_ == kReduceDerivative) {
+      // Take the derivative of bodies when reduce_cond_ is true.
       for (PrimExpr expr : op->source) {
         expr = VisitExpr(expr);
         expr = MulNode::make(expr, head_val_);
@@ -312,6 +343,7 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
     for (const auto& expr : op->source)
       source.push_back(expr);
 
+    // Substitute old axes by new axes.
     for (size_t i = 0; i < source.size(); ++i)
       source.Set(i, Substitute(source[i], vmap));
     PrimExpr cond = reduce_type_ == kReducePartially ? reduce_cond_ : PrimExpr();
@@ -368,10 +400,16 @@ class TensorArgsReplacer : public ExprFunctor<PrimExpr(const PrimExpr&)> {
   ReduceType reduce_type_;
   PrimExpr reduce_cond_;
   PrimExpr head_val_;
+  bool replaced_;
 };
 
 #undef NOT_IMPLEMENTED
 
+/*
+ * Reductions are only allowed at the top level of compute. So for farther
+ * composition, we must create another tensor. This is a helper function to
+ * do such thing.
+ */
 PrimExpr TensorizeExpr(const PrimExpr& expr,
                        const Array<IterVar>& vars,
                        const std::string& name,
@@ -390,6 +428,7 @@ PrimExpr TensorizeExpr(const PrimExpr& expr,
 
   const ReduceNode* reduce = new_expr.as<ReduceNode>();
   if (reduce && reduce->source.size() > 1) {
+    // We have to copy the ReduceNode several times as new bodies.
     for (size_t i = 0; i < reduce->source.size(); ++i)
       body.push_back(ReduceNode::make(
             reduce->combiner, reduce->source, reduce->axis, reduce->condition, i));
@@ -402,6 +441,23 @@ PrimExpr TensorizeExpr(const PrimExpr& expr,
   Operation op = ComputeOpNode::make(name, tag, attrs, new_vars, body);
   return CallNode::make(new_expr.dtype(), name, values, CallNode::Halide, op, value_index);
 }
+
+/*
+ * Now consider how to take the derivative of ReduceNode. Suppose we have
+ * the input tensor's axis i, the output tensor's axis j and the reduction's
+ * axis k. Equations are built between i and the input tensor's given argument
+ * in the output tensor (which is a function of j and k).
+ *
+ * A first approach is to fix i, and solve equations for j and k. Sum across
+ * free variables, and we need only focus on how to take the derivate when i,
+ * j, k are all given. This method is implemented in CalcOneByOneDerivative.
+ *
+ * A second approach is to fix i and always perform original reduction on k.
+ * For fixed i and k, we solve equations for j. We will take the derivative
+ * in the reduction once there is such j that satisfies those equations. Summing
+ * across free variables is still needed outside the reduction. This method
+ * is implemented in CalcConditionalDerivative.
+ */
 
 std::pair<PrimExpr, Array<PrimExpr>> CalcOneByOneDerivative(
                                         int idx,
@@ -423,7 +479,25 @@ std::pair<PrimExpr, Array<PrimExpr>> CalcOneByOneDerivative(
   PrimExpr expr = op->body[output->value_index];
   const ReduceNode* reduce = expr.as<ReduceNode>();
   CHECK(reduce);
+  CHECK_EQ(reduce->source.size(), (size_t)1);
 
+  /*
+   * Suppose the reduction's body is evaluated along its axis as a_1, ..., a_n.
+   * And denote its combiner as the function f(x, y). Let f(x, y, z) be f(f(x, y), z)
+   * and so on.
+   *
+   * Now we are going to take the derivative with respect to some tensor in a_k.
+   * Because the combiner is commutative, we can write:
+   *    f(a_1, ..., a_n) = f(a_1, ..., a_{k-1}, a_{k+1}, ..., a_n, a_k)
+   *                     = f(f(a_1, ..., a_{k-1}, a_{k+1}, ..., a_n), a_k)
+   * We need only calculate:
+   *   1. f(a_1, ..., a_{k-1}, a_{k+1}, ..., a_n)
+   *   2. a_k
+   *   3. the derivative of f with respect to x and y
+   *   4. the derivative of a_k with respect to the specified tensor
+   * The final result can be easily carried out from above expressions, after
+   * some simple substitution and multiplication.
+   */
   PrimExpr sub_cond;
   for (const auto& iv : reduce->axis) {
     PrimExpr e = NENode::make(tf->src_to_dst[iv->var], iv->var);
@@ -503,6 +577,9 @@ std::pair<PrimExpr, Array<PrimExpr>> CalcConditionalDerivative(
   return std::make_pair(sub_result, cond);
 }
 
+/*
+ * Take the derivative when there is no reduction.
+ */
 std::pair<PrimExpr, Array<PrimExpr>> CalcNormalDerivative(
                                         const Tensor& input,
                                         const Array<IterVar>& input_iv,
@@ -532,6 +609,28 @@ std::pair<PrimExpr, Array<PrimExpr>> CalcNormalDerivative(
   return std::make_pair(sub_result, cond);
 }
 
+/*
+ * When there is a ReduceNode, this function will tell us which method
+ * (one-by-one derivative or conditional derivative) should be chosen
+ * to take the derivative.
+ *
+ * Suppose axes i, j, k are defined same as before. Fix i and j, then solve
+ * equations for k. If there is at most one k that satisfies those equations,
+ * we'll choose one-by-one derivative method, otherwise we choose conditional
+ * derivative method.
+ *
+ * The reason is clear for one-dimensional situation. If such k is unique when
+ * i and j are fixed, one-by-one derivative method can avoid much unnecessary
+ * work compared with conditional derivative method, especially when the
+ * reduction is a sum. But if such k is not unique, it is likely that k can
+ * take all values over its range. In that case, one-by-one derivative method
+ * will involve much duplicative work, compared with conditional derivative
+ * method.
+ *
+ * TODO: In high-dimensional situation, it seems to be possible and it would
+ * work much better if we can choose different methods for different reduction
+ * axes.
+ */
 bool ChooseDerivativeMethod(const arith::IntConstraintsTransform& tf,
                             const Tensor& output) {
   bool result = true;
@@ -551,12 +650,15 @@ bool ChooseDerivativeMethod(const arith::IntConstraintsTransform& tf,
     vset.insert(v.get());
   for (const auto& iv : op->reduce_axis)
     result = result && !ExprUseVar(tf->src_to_dst[iv->var], vset);
-  // TODO: Choose different methods for different axes,
-  //       according to their respective flags.
 
   return result;
 }
 
+/*
+ * The equation solver can generate some free variables and some conditions.
+ * This function will sum up a given expression across those free variables,
+ * and restrict the expression according to those conditions.
+ */
 PrimExpr SumUpDerivatives(const PrimExpr& expr,
                           const Array<PrimExpr>& cond,
                           const arith::IntConstraints& dst,
@@ -567,6 +669,8 @@ PrimExpr SumUpDerivatives(const PrimExpr& expr,
   std::unordered_set<const VarNode*> vset;
   for (const Var& var : dst->variables)
     vset.insert(var.get());
+  // Split conditions into two parts. The inner part depends on free variables
+  // across which we are going to sum, while the outer part doesn't.
   for (const auto& rel : cond) {
     if (ExprUseVar(rel, vset))
       inner_cond = inner_cond.get() ? AndNode::make(inner_cond, rel) : rel;
@@ -600,7 +704,6 @@ PrimExpr SumUpDerivatives(const PrimExpr& expr,
 
 } // namespace vjp
 
-// TODO: Add comments.
 Tensor VectorJacobianProductOptimized(const Tensor& output,
                                       const Tensor& input,
                                       const Tensor& head)
@@ -612,6 +715,7 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
   CHECK_GE(head->shape.size(), output->shape.size())
       << "head->shape shouldn't have less elements than output->shape";
 
+  // Do some preparation, calculate the result tensor's shape, axis, and so on.
   Array<PrimExpr> shape;
   Array<IterVar> axis, input_axis;
   Array<PrimExpr> head_indices;
@@ -628,6 +732,9 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
   }
   for (const IterVar& it : op->axis)
     head_indices.push_back(it->var);
+  // head_val = head(head_indices)
+  // Note that the final expression shouldn't have variables of output's axis (op->axis),
+  // but head_val does have those variables now. So they must be substituted later.
   PrimExpr head_val = CallNode::make(head->dtype, head->op->name,
           head_indices, CallNode::Halide, head->op, head->value_index);
 
@@ -641,6 +748,8 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
     input_axis.push_back(iv);
   }
 
+  // Calculate several lists of variables and ranges, which will be used
+  // when solving equations later.
   Array<Var> vars;
   Map<Var, Range> ranges;
   for (const IterVar& it : op->axis) {
@@ -664,10 +773,19 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
     vjp::TensorArgsCollector collector(input);
     Array<Array<PrimExpr>> args = collector.Collect(expr);
 
+    /*
+     * The input tensor may occur several times in the output tensor with
+     * different lists of arguments. (Here the word "different" means their
+     * memory addresses, instead of their contents, are different.)
+     *
+     * We simply take the derivative of each of them (in the below for-loop)
+     * respectively and add the derivatives up to get the final result.
+     */
     for (size_t idx = 0; idx < args.size(); ++idx) {
       Array<PrimExpr> arg = args[idx];
       CHECK_EQ(arg.size(), input_axis.size());
 
+      // These equations will be solved for variables of output axis and/or reduce axis.
       Array<PrimExpr> eqs;
       for (size_t i = 0; i < arg.size(); ++i)
         eqs.push_back(EQNode::make(arg[i], input_axis[i]->var));
@@ -684,6 +802,7 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
         tf = arith::SolveLinearEquations(constraints);
       }
 
+      // Choose and perform a suitable method to calculate the derivative.
       if (reduce && vjp::ChooseDerivativeMethod(tf, output)) {
         constraints = arith::IntConstraints(all_vars, all_ranges, eqs);
         tf = arith::SolveLinearEquations(constraints);
@@ -702,6 +821,7 @@ Tensor VectorJacobianProductOptimized(const Tensor& output,
 
       sub_result = vjp::SumUpDerivatives(sub_result, cond, tf->dst, idx, axis, input);
 
+      // Add sub_result into result.
       if (result.as<ReduceNode>())
         result = vjp::TensorizeExpr(result, axis,
             input->op->name + ".grad" + std::to_string(idx - 1), input->op);

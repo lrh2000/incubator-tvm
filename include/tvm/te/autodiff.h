@@ -70,6 +70,21 @@ Tensor Jacobian(const Tensor& output, const Tensor& input);
  */
 Tensor VectorJacobianProduct(const Tensor &output, const Tensor &input, const Tensor &head);
 
+/*!
+ * \brief The optimized version of the function VectorJacobianProduct.
+ *
+ *  With the same parameters given, this function's return value should be equivalent to
+ *  VectorJacobianProduct's. However, this function will avoid to calculate the Jacobian matrix
+ *  first and then multiply it by \p head using tensor dot product. Instead, it will directly
+ *  calculate the final result. This usually leads to a much simpler expression, because there
+ *  are lots of zeros in Jacobian matrix, under most circumstances.
+ *
+ * \param output The tensor to differentiate.
+ * \param input The input tensor, which \p output should directly use.
+ * \param head The adjoint of \p output. Must be of shape `prefix + output.shape`
+ * \return The tensor of shape `prefix + input.shape`
+ *         representing the partial adjoint of \p input wrt one of its consumers (output)
+ */
 
 Tensor VectorJacobianProductOptimized(const Tensor &output,
                                       const Tensor &input,
